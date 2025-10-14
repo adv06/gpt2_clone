@@ -26,11 +26,12 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs) why this ordering
         
-        att = (q @ k.transpose(-2, -1)) * 1.0/(math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim = -1)
+        # att = (q @ k.transpose(-2, -1)) * 1.0/(math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim = -1)
+        # y = att @ v # B, nh, T, T * B, nh, T, hs  --> B, nh, T, hs
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         
-        y = att @ v # B, nh, T, T * B, nh, T, hs  --> B, nh, T, hs
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         
@@ -210,22 +211,31 @@ class DataLoaderLite:
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
-train_loader = DataLoaderLite(B=4, T=32)
+import time 
 
+train_loader = DataLoaderLite(B=16, T=1024)
+torch.set_float32_matmul_precision('high')
 
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-# logits, loss = model(x, y)
+model = torch.compile(model)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad() # start with a zero gradient
-    logits, loss = model(x, y)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
-    optimizer.step()
-    print(f"step {i} loss {loss.item()}")
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clip the gradient norm, scales down gradients if norm > 1.0
+    optimizer.step() 
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1-t0)*1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i} loss {loss.item()} dt: {dt:.2f}ms norm: {norm:.4f} tok/sec: {tokens_per_sec:.2f}")
 
 import sys
 sys.exit(0)
